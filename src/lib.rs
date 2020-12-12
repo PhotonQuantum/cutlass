@@ -1,6 +1,7 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
+
 use quote::{format_ident, quote};
 use syn::punctuated::Punctuated;
 use syn::{parse_macro_input, Block, FnArg, ItemFn, Pat, ReturnType, Type};
@@ -40,19 +41,48 @@ fn extract_arg_idents(fn_args: Punctuated<FnArg, syn::token::Comma>) -> Vec<Box<
     return fn_args.into_iter().map(extract_arg_pat).collect::<Vec<_>>();
 }
 
+fn remove_traits_from_generics(generics: &syn::Generics) -> syn::Generics {
+    let mut new_generics = generics.clone();
+    let new_params = generics
+        .params
+        .iter()
+        .map(|g| {
+            if let syn::GenericParam::Type(ty) = g {
+                let mut new_ty = ty.clone();
+                new_ty.bounds = Punctuated::default();
+                new_ty.colon_token = None;
+                syn::GenericParam::Type(new_ty)
+            } else {
+                panic!("Not support on generics with lifetime!")
+            }
+        })
+        .collect();
+    new_generics.params = new_params;
+    new_generics
+}
+
 fn generate_type_aliases(
     fn_arg_types: &[Box<Type>],
     fn_return_type: Box<Type>,
     fn_name: &syn::Ident,
+    fn_generics: Option<&syn::Generics>,
 ) -> Vec<proc_macro2::TokenStream> {
     let type_t0 = format_ident!("_T0{}", fn_name);
-    let mut type_aliases = vec![quote! { type #type_t0 = #fn_return_type }];
+    let fn_generics_without_traits = fn_generics.and_then(|g| Some(remove_traits_from_generics(g)));
+    let mut type_aliases = if let Some(_) = fn_generics {
+        vec![quote! { type #type_t0 #fn_generics_without_traits = #fn_return_type }]
+    } else {
+        vec![quote! { type #type_t0 = #fn_return_type }]
+    };
     for (i, t) in (1..).zip(fn_arg_types.into_iter().rev()) {
         let p = format_ident!("_{}{}", format!("T{}", i - 1), fn_name);
         let n = format_ident!("_{}{}", format!("T{}", i), fn_name);
-        type_aliases.push(quote! {
-            type #n = impl Fn(#t) -> #p
-        })
+        let type_alias = if let Some(_) = fn_generics {
+            quote! { type #n #fn_generics_without_traits = impl Fn(#t) -> #p #fn_generics_without_traits }
+        } else {
+            quote! { type #n = impl Fn(#t) -> #p }
+        };
+        type_aliases.push(type_alias)
     }
     return type_aliases;
 }
@@ -68,6 +98,7 @@ fn generate_curry(parsed: ItemFn) -> proc_macro2::TokenStream {
     let sig = parsed.sig;
     let vis = parsed.vis;
     let fn_name = sig.ident;
+    let fn_generics = sig.generics;
     let fn_args = sig.inputs;
     let fn_return_type = sig.output;
 
@@ -81,14 +112,29 @@ fn generate_curry(parsed: ItemFn) -> proc_macro2::TokenStream {
         &arg_types[1..],
         extract_return_type(fn_return_type),
         &fn_name,
+        if let Some(_) = fn_generics.lt_token {
+            Some(&fn_generics)
+        } else {
+            None
+        },
     );
 
     let return_type = format_ident!("_{}{}", format!("T{}", type_aliases.len() - 1), &fn_name);
 
-    let gen = quote! {
-        #(#type_aliases);* ;
-        #vis fn #fn_name (#first_ident: #first_type) -> #return_type {
-            #curried_body ;
+    let gen = if let Some(_) = fn_generics.lt_token {
+        let fn_generics_without_traits = remove_traits_from_generics(&fn_generics);
+        quote! {
+            #(#type_aliases);* ;
+            #vis fn #fn_name #fn_generics (#first_ident: #first_type) -> #return_type #fn_generics_without_traits {
+                #curried_body ;
+            }
+        }
+    } else {
+        quote! {
+            #(#type_aliases);* ;
+            #vis fn #fn_name (#first_ident: #first_type) -> #return_type {
+                #curried_body ;
+            }
         }
     };
 
